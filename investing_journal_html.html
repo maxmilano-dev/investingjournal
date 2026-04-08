@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Investing Journal</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: 'class' };
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; }
+    input[type=range] { accent-color: #4f46e5; }
+    textarea { font-family: inherit; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } = Recharts;
+
+    // ── constants ────────────────────────────────────────────────────────────
+    const AV_BASE   = "https://www.alphavantage.co/query";
+    const ANTHROPIC = "https://api.anthropic.com/v1/messages";
+    const MODEL     = "claude-sonnet-4-20250514";
+
+    const ASSET_TYPES = ["Stock","ETF","Commodity","Crypto","Bond","Other"];
+    const ENTRY_TYPES = ["News","Analysis","Trade idea","Reflection","Watchlist add"];
+    const SENTIMENTS  = ["Bullish","Neutral","Bearish"];
+    const SENT_STYLE  = { Bullish:"bg-emerald-100 text-emerald-700 border-emerald-300", Neutral:"bg-slate-100 text-slate-500 border-slate-300", Bearish:"bg-rose-100 text-rose-700 border-rose-300" };
+    const SENT_ACTIVE = { Bullish:"bg-emerald-500 text-white border-emerald-500", Neutral:"bg-slate-500 text-white border-slate-500", Bearish:"bg-rose-500 text-white border-rose-500" };
+
+    const CURRENCIES = [
+      { code:"USD", symbol:"$", name:"US Dollar" },
+      { code:"EUR", symbol:"€", name:"Euro" },
+      { code:"GBP", symbol:"£", name:"British Pound" },
+      { code:"JPY", symbol:"¥", name:"Japanese Yen" },
+      { code:"CAD", symbol:"CA$", name:"Canadian Dollar" },
+      { code:"AUD", symbol:"A$", name:"Australian Dollar" },
+      { code:"CHF", symbol:"Fr", name:"Swiss Franc" },
+      { code:"INR", symbol:"₹", name:"Indian Rupee" },
+      { code:"BRL", symbol:"R$", name:"Brazilian Real" },
+      { code:"SGD", symbol:"S$", name:"Singapore Dollar" },
+    ];
+    const LANGUAGES = [
+      { code:"en", name:"English" },{ code:"es", name:"Español" },{ code:"fr", name:"Français" },
+      { code:"de", name:"Deutsch" },{ code:"ja", name:"日本語" },{ code:"zh", name:"中文" },
+      { code:"pt", name:"Português" },{ code:"ko", name:"한국어" },
+    ];
+    const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    const DEFAULT_SETTINGS = {
+      avKey:"", theme:"light", currency:"USD", language:"en",
+      dateFormat:"YYYY-MM-DD", numberFormat:"1,234.56",
+      defaultSentiment:"", compactNumbers:false, showCostBasis:true,
+      aiCommentaryAuto:false, fiscalYearStart:"January",
+    };
+    const WIZARD_STEPS = [
+      { key:"style",      label:"What's your core investing philosophy?",   type:"chips",    opts:["Value","Growth","Income","Momentum","Mixed"] },
+      { key:"risk",       label:"Risk tolerance",                           type:"slider" },
+      { key:"horizon",    label:"Time horizon",                             type:"chips",    opts:["< 1 year","1–3 years","3–10 years","10–20 years","20+ years"] },
+      { key:"analysis",   label:"Preferred analysis style",                 type:"chips",    opts:["Fundamental","Technical","Macro","Quantitative","Mixed"] },
+      { key:"principles", label:"Core principles you always follow",        type:"textarea", placeholder:"e.g. Never invest in what I don't understand…" },
+      { key:"avoid",      label:"What do you avoid?",                       type:"textarea", placeholder:"e.g. Leveraged ETFs, meme stocks, crypto…" },
+      { key:"persona",    label:"How should your buddy talk to you?",       type:"textarea", placeholder:"e.g. Be a Socratic devil's advocate…" },
+      { key:"heroes",     label:"Investing heroes / influences (optional)", type:"textarea", placeholder:"e.g. Buffett, Howard Marks, Cathie Wood…" },
+    ];
+
+    const uid    = () => Math.random().toString(36).slice(2,9);
+    const today  = () => new Date().toISOString().slice(0,10);
+    const fPct   = n  => (Number(n)>=0?"+":"")+Number(n).toFixed(2)+"%";
+
+    function formatNum(n, settings) {
+      const c   = CURRENCIES.find(x=>x.code===settings.currency)||CURRENCIES[0];
+      const abs = Math.abs(Number(n));
+      let str;
+      if (settings.compactNumbers && abs>=1000) {
+        if (abs>=1e9) str=(abs/1e9).toFixed(1)+"B";
+        else if (abs>=1e6) str=(abs/1e6).toFixed(1)+"M";
+        else str=(abs/1e3).toFixed(1)+"K";
+      } else {
+        str = abs.toFixed(2);
+        if (settings.numberFormat==="1.234,56") str=str.replace(".",",");
+      }
+      return (Number(n)<0?"-":"")+c.symbol+str;
+    }
+    function fDollarGeneric(n, settings) { return (Number(n)>=0?"+":"-")+formatNum(Math.abs(n),settings); }
+    function isDark(theme) {
+      const sys = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      return theme==="dark"||(theme==="system"&&sys);
+    }
+
+    // ── localStorage (replaces window.storage) ───────────────────────────────
+    function sget(key, fallback=null) {
+      try { const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; } catch { return fallback; }
+    }
+    function sset(key, val) {
+      try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+    }
+
+    // ── Anthropic ────────────────────────────────────────────────────────────
+    async function askBuddy(sys, user) {
+      const res = await fetch(ANTHROPIC, {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ model:MODEL, max_tokens:1000, system:sys, messages:[{role:"user",content:user}] })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      return data.content?.find(b=>b.type==="text")?.text||"";
+    }
+    function buildSys(p, settings) {
+      const lang = LANGUAGES.find(l=>l.code===settings.language)||LANGUAGES[0];
+      return `You are the user's personal investing buddy. Respond in ${lang.name}. Their philosophy:
+STYLE: ${p.style||"(not set)"}
+PRINCIPLES: ${p.principles||"(not set)"}
+AVOID: ${p.avoid||"(not set)"}
+RISK TOLERANCE: ${p.risk??5}/10
+BUDDY PERSONA: ${p.persona||"Be thoughtful and analytical"}
+HEROES: ${p.heroes||"(none)"}
+Always check ideas against their philosophy. Challenge assumptions. Ask probing questions.`;
+    }
+
+    // ── Shared UI ────────────────────────────────────────────────────────────
+    function BuddyPanel({ text, loading }) {
+      if (!loading && !text) return null;
+      return (
+        <div className="mt-4 border-l-4 border-indigo-400 bg-indigo-50 dark:bg-indigo-950/50 dark:border-indigo-500 rounded-r-xl p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-lg">🤖</span>
+            <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400 uppercase tracking-wide">Buddy</span>
+          </div>
+          {loading
+            ? <div className="flex items-center gap-2 text-sm text-indigo-500"><span className="animate-spin inline-block">⟳</span> Thinking…</div>
+            : <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">{text}</p>}
+        </div>
+      );
+    }
+
+    function Toggle({ label, desc, checked, onChange }) {
+      return (
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium text-slate-700 dark:text-slate-200">{label}</p>
+            {desc && <p className="text-xs text-slate-400 dark:text-slate-500">{desc}</p>}
+          </div>
+          <button onClick={()=>onChange(!checked)} className={`relative w-11 h-6 rounded-full transition-colors ${checked?"bg-indigo-600":"bg-slate-200 dark:bg-slate-600"}`}>
+            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${checked?"translate-x-5":""}`}/>
+          </button>
+        </div>
+      );
+    }
+    function SectionHeader({ children }) {
+      return <p className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest pt-2 pb-1 border-b border-slate-100 dark:border-slate-700 mb-3">{children}</p>;
+    }
+
+    // ── Settings Modal ───────────────────────────────────────────────────────
+    function SettingsModal({ settings, onSave, onClose }) {
+      const [local, setLocal] = useState({...settings});
+      const [showKey, setShowKey] = useState(false);
+      const [saved, setSaved] = useState(false);
+      const set = (k,v) => setLocal(s=>({...s,[k]:v}));
+      const save = () => { sset("app_settings",local); onSave(local); setSaved(true); setTimeout(()=>setSaved(false),1500); };
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-700 w-full max-w-md max-h-[90vh] flex flex-col">
+            <div className="flex justify-between items-center px-6 py-4 border-b border-slate-100 dark:border-slate-700 flex-shrink-0">
+              <h2 className="font-semibold text-slate-800 dark:text-slate-100 text-lg">⚙️ Settings</h2>
+              <button onClick={onClose} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 text-2xl leading-none">×</button>
+            </div>
+            <div className="overflow-y-auto flex-1 px-6 py-4 space-y-4">
+              <SectionHeader>API Keys</SectionHeader>
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">Alpha Vantage API Key</label>
+                <div className="flex gap-2">
+                  <input type={showKey?"text":"password"} value={local.avKey} onChange={e=>set("avKey",e.target.value)} placeholder="Paste your key…"
+                    className="flex-1 border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+                  <button onClick={()=>setShowKey(v=>!v)} className="px-3 py-2 border border-slate-200 dark:border-slate-600 rounded-xl text-xs text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-700">{showKey?"Hide":"Show"}</button>
+                </div>
+                <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">Free key at <a href="https://alphavantage.co" target="_blank" className="text-indigo-500 hover:underline">alphavantage.co</a> — stored locally only.</p>
+              </div>
+
+              <SectionHeader>Appearance</SectionHeader>
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">Theme</label>
+                <select value={local.theme} onChange={e=>set("theme",e.target.value)}
+                  className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none">
+                  <option value="light">☀️ Light</option>
+                  <option value="dark">🌙 Dark</option>
+                  <option value="system">💻 System Default</option>
+                </select>
+              </div>
+
+              <SectionHeader>Locale & Format</SectionHeader>
+              {[["Language","language",LANGUAGES.map(l=>({v:l.code,l:l.name}))],["Currency","currency",CURRENCIES.map(c=>({v:c.code,l:`${c.symbol} ${c.code} — ${c.name}`}))],
+                ["Date Format","dateFormat",[{v:"YYYY-MM-DD",l:"YYYY-MM-DD (2025-04-07)"},{v:"MM/DD/YYYY",l:"MM/DD/YYYY (04/07/2025)"},{v:"DD/MM/YYYY",l:"DD/MM/YYYY (07/04/2025)"},{v:"MMM D, YYYY",l:"MMM D, YYYY (Apr 7, 2025)"}]],
+                ["Number Format","numberFormat",[{v:"1,234.56",l:"1,234.56 (US/UK)"},{v:"1.234,56",l:"1.234,56 (EU/Latin America)"}]]
+              ].map(([lbl,k,opts])=>(
+                <div key={k}>
+                  <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">{lbl}</label>
+                  <select value={local[k]} onChange={e=>set(k,e.target.value)}
+                    className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none">
+                    {opts.map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+                  </select>
+                </div>
+              ))}
+
+              <SectionHeader>Journal Defaults</SectionHeader>
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">Default Sentiment</label>
+                <select value={local.defaultSentiment} onChange={e=>set("defaultSentiment",e.target.value)}
+                  className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none">
+                  <option value="">None (require selection)</option>
+                  {SENTIMENTS.map(s=><option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">Fiscal Year Start</label>
+                <select value={local.fiscalYearStart} onChange={e=>set("fiscalYearStart",e.target.value)}
+                  className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none">
+                  {MONTHS.map(m=><option key={m}>{m}</option>)}
+                </select>
+              </div>
+
+              <SectionHeader>Display</SectionHeader>
+              <div className="space-y-4">
+                <Toggle label="Compact numbers" desc="Show 1.2M instead of 1,200,000" checked={local.compactNumbers} onChange={v=>set("compactNumbers",v)}/>
+                <Toggle label="Show cost basis" desc="Display cost basis on performance cards" checked={local.showCostBasis} onChange={v=>set("showCostBasis",v)}/>
+                <Toggle label="Auto-generate buddy comments" desc="Request AI feedback automatically on new entries" checked={local.aiCommentaryAuto} onChange={v=>set("aiCommentaryAuto",v)}/>
+              </div>
+
+              <SectionHeader>Data & Privacy</SectionHeader>
+              <div className="bg-slate-50 dark:bg-slate-800 rounded-xl p-3 text-xs text-slate-500 dark:text-slate-400 space-y-1">
+                <p>✅ All data is stored locally in your browser via localStorage.</p>
+                <p>✅ API keys are never sent to third parties.</p>
+                <p>✅ No account required. No data leaves your device except for API calls.</p>
+              </div>
+              <button onClick={()=>{ if(confirm("Reset ALL app data? This cannot be undone.")) { sset("journal_entries",[]); sset("positions",[]); sset("investing_philosophy",null); sset("app_settings",DEFAULT_SETTINGS); onSave(DEFAULT_SETTINGS); onClose(); window.location.reload(); }}}
+                className="w-full py-2 border border-rose-200 text-rose-500 text-sm font-medium rounded-xl hover:bg-rose-50 dark:hover:bg-rose-900/20 transition-colors">
+                🗑 Reset All App Data
+              </button>
+            </div>
+            <div className="px-6 py-4 border-t border-slate-100 dark:border-slate-700 flex-shrink-0 flex justify-end gap-2">
+              <button onClick={onClose} className="px-4 py-2 text-sm text-slate-500 dark:text-slate-400">Cancel</button>
+              <button onClick={save} className="px-6 py-2 bg-indigo-600 text-white text-sm font-semibold rounded-xl hover:bg-indigo-700 transition-colors">
+                {saved?"✓ Saved":"Save Settings"}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Onboarding Wizard ────────────────────────────────────────────────────
+    function OnboardingWizard({ onDone }) {
+      const [step, setStep] = useState(0);
+      const [answers, setAnswers] = useState({ style:"Value", risk:5, horizon:"1–3 years", analysis:"Fundamental", principles:"", avoid:"", persona:"", heroes:"" });
+      const s = WIZARD_STEPS[step]; const isLast = step===WIZARD_STEPS.length-1;
+      const set = (k,v) => setAnswers(a=>({...a,[k]:v}));
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 max-w-lg w-full p-8">
+            <div className="flex gap-1 mb-7">{WIZARD_STEPS.map((_,i)=><div key={i} className={`h-1 flex-1 rounded-full transition-colors ${i<=step?"bg-indigo-500":"bg-slate-200"}`}/>)}</div>
+            <p className="text-xs text-slate-400 mb-1">Step {step+1} of {WIZARD_STEPS.length}</p>
+            <h2 className="text-xl font-semibold text-slate-800 mb-6">{s.label}</h2>
+            {s.type==="chips" && <div className="flex flex-wrap gap-2 mb-8">{s.opts.map(o=><button key={o} onClick={()=>set(s.key,o)} className={`px-4 py-1.5 rounded-full border text-sm font-medium transition-all ${answers[s.key]===o?"bg-indigo-600 text-white border-indigo-600":"border-slate-200 text-slate-500 hover:border-indigo-300"}`}>{o}</button>)}</div>}
+            {s.type==="slider" && <div className="mb-8"><div className="flex justify-between text-xs text-slate-400 mb-2"><span>1 — Capital preservation</span><span>10 — High risk/reward</span></div><input type="range" min={1} max={10} value={answers.risk} onChange={e=>set("risk",Number(e.target.value))} className="w-full mb-2"/><p className="text-center text-2xl font-bold text-indigo-600">{answers.risk}<span className="text-slate-300 text-base font-normal">/10</span></p></div>}
+            {s.type==="textarea" && <textarea rows={4} placeholder={s.placeholder} value={answers[s.key]} onChange={e=>set(s.key,e.target.value)} className="w-full border border-slate-200 rounded-xl p-3 text-sm text-slate-700 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-300 mb-8"/>}
+            <div className="flex justify-between">
+              <button onClick={()=>setStep(s=>Math.max(0,s-1))} disabled={step===0} className="px-4 py-2 text-sm text-slate-400 disabled:opacity-30">← Back</button>
+              <button onClick={()=>isLast?onDone(answers):setStep(s=>s+1)} className="px-6 py-2 bg-indigo-600 text-white text-sm font-semibold rounded-xl hover:bg-indigo-700">{isLast?"Launch my Journal 🚀":"Next →"}</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Journal Tab ──────────────────────────────────────────────────────────
+    function JournalTab({ philosophy, settings }) {
+      const [entries, setEntries] = useState([]);
+      const [showForm, setShowForm] = useState(false);
+      const [fTicker,setFTicker]=useState(""); const [fAsset,setFAsset]=useState(""); const [fType,setFType]=useState(""); const [fSent,setFSent]=useState("");
+      const [expandedId, setExpandedId] = useState(null);
+      const [buddy, setBuddy] = useState({});
+      const emptyForm = { ticker:"", assetType:"Stock", entryType:"Analysis", sentiment:settings.defaultSentiment||"", note:"", date:today() };
+      const [form, setForm] = useState(emptyForm);
+      const [editId, setEditId] = useState(null);
+
+      useEffect(()=>{ setEntries(sget("journal_entries",[])); },[]);
+
+      const persist = u => { setEntries(u); sset("journal_entries",u); };
+      const save = () => {
+        if (!form.ticker.trim()||!form.sentiment) return;
+        const e={...form,ticker:form.ticker.toUpperCase(),id:editId||uid()};
+        const updated=editId?entries.map(x=>x.id===editId?e:x):[e,...entries];
+        persist(updated); setForm(emptyForm); setEditId(null); setShowForm(false);
+        if (settings.aiCommentaryAuto&&!editId) getFeedback(e);
+      };
+      const del = id => persist(entries.filter(e=>e.id!==id));
+      const getFeedback = async entry => {
+        setBuddy(s=>({...s,[entry.id]:{text:"",loading:true}}));
+        try {
+          const text=await askBuddy(buildSys(philosophy,settings),`Review this journal entry:\nTicker: ${entry.ticker}\nType: ${entry.assetType} / ${entry.entryType}\nSentiment: ${entry.sentiment}\nDate: ${entry.date}\n\n${entry.note}`);
+          setBuddy(s=>({...s,[entry.id]:{text,loading:false}}));
+        } catch(e){ setBuddy(s=>({...s,[entry.id]:{text:`Error: ${e.message}`,loading:false}})); }
+      };
+
+      const filtered=entries.filter(e=>(!fTicker||e.ticker.includes(fTicker.toUpperCase()))&&(!fAsset||e.assetType===fAsset)&&(!fType||e.entryType===fType)&&(!fSent||e.sentiment===fSent));
+
+      return (
+        <div className="max-w-2xl mx-auto py-6 space-y-5">
+          <div className="flex justify-between items-center">
+            <h2 className="font-semibold text-slate-800 dark:text-slate-100 text-base">Journal</h2>
+            <button onClick={()=>{setForm(emptyForm);setEditId(null);setShowForm(v=>!v);}} className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-xl hover:bg-indigo-700 transition-colors">{showForm?"Cancel":"+ New Entry"}</button>
+          </div>
+          {showForm&&(
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 space-y-4 shadow-sm">
+              <div className="flex gap-3 flex-wrap">
+                <input placeholder="Ticker / Asset" value={form.ticker} onChange={e=>setForm(f=>({...f,ticker:e.target.value}))} className="flex-1 min-w-32 border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+                <input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} className="border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+              </div>
+              <div className="flex gap-3 flex-wrap">
+                {[["assetType",ASSET_TYPES],["entryType",ENTRY_TYPES]].map(([k,opts])=>(
+                  <select key={k} value={form[k]} onChange={e=>setForm(f=>({...f,[k]:e.target.value}))} className="border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 focus:outline-none">
+                    {opts.map(o=><option key={o}>{o}</option>)}
+                  </select>
+                ))}
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-2">Sentiment <span className="text-rose-400">*</span></p>
+                <div className="flex gap-2">{SENTIMENTS.map(s=><button key={s} onClick={()=>setForm(f=>({...f,sentiment:s}))} className={`px-4 py-1.5 rounded-full border text-sm font-medium transition-all ${form.sentiment===s?SENT_ACTIVE[s]:SENT_STYLE[s]}`}>{s}</button>)}</div>
+              </div>
+              <textarea rows={5} placeholder="Your thoughts, thesis, observations…" value={form.note} onChange={e=>setForm(f=>({...f,note:e.target.value}))} className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+              <div className="flex justify-end gap-2">
+                <button onClick={()=>setShowForm(false)} className="px-4 py-2 text-sm text-slate-500">Cancel</button>
+                <button onClick={save} disabled={!form.ticker.trim()||!form.sentiment} className="px-5 py-2 bg-indigo-600 text-white text-sm font-semibold rounded-xl hover:bg-indigo-700 disabled:opacity-40">{editId?"Update":"Save Entry"}</button>
+              </div>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2 items-center">
+            <input placeholder="Filter ticker…" value={fTicker} onChange={e=>setFTicker(e.target.value)} className="border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-1.5 text-xs bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 focus:outline-none w-32"/>
+            {[[fAsset,setFAsset,ASSET_TYPES,"Asset"],[fType,setFType,ENTRY_TYPES,"Type"]].map(([val,set,opts,lbl])=>(
+              <select key={lbl} value={val} onChange={e=>set(e.target.value)} className="border border-slate-200 dark:border-slate-600 rounded-xl px-2 py-1.5 text-xs bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 focus:outline-none">
+                <option value="">All {lbl}s</option>{opts.map(o=><option key={o}>{o}</option>)}
+              </select>
+            ))}
+            <div className="flex gap-1">{SENTIMENTS.map(s=><button key={s} onClick={()=>setFSent(v=>v===s?"":s)} className={`px-3 py-1 rounded-full border text-xs font-medium transition-all ${fSent===s?SENT_ACTIVE[s]:SENT_STYLE[s]}`}>{s}</button>)}</div>
+            {(fTicker||fAsset||fType||fSent)&&<button onClick={()=>{setFTicker("");setFAsset("");setFType("");setFSent("");}} className="text-xs text-slate-400 hover:text-slate-600 underline">Clear</button>}
+          </div>
+          {filtered.length===0&&<div className="text-center py-16 text-slate-400 space-y-2"><p className="text-4xl">📓</p><p className="text-sm font-medium">No entries yet</p><p className="text-xs">Start logging ideas, trades, and reflections above.</p></div>}
+          {filtered.map(e=>{
+            const exp=expandedId===e.id; const bs=buddy[e.id];
+            return (
+              <div key={e.id} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 shadow-sm">
+                <div className="flex items-start justify-between gap-2 mb-2">
+                  <div className="flex flex-wrap gap-1.5 items-center">
+                    <span className="font-mono font-bold text-slate-800 dark:text-slate-100 text-sm">{e.ticker}</span>
+                    <span className="text-xs bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 px-2 py-0.5 rounded-full">{e.assetType}</span>
+                    <span className="text-xs bg-indigo-50 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-300 px-2 py-0.5 rounded-full">{e.entryType}</span>
+                    {e.sentiment&&<span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${SENT_STYLE[e.sentiment]}`}>{e.sentiment}</span>}
+                  </div>
+                  <span className="text-xs text-slate-400 whitespace-nowrap">{e.date}</span>
+                </div>
+                <p className={`text-sm text-slate-600 dark:text-slate-400 leading-relaxed ${exp?"":"overflow-hidden"}`} style={exp?{}:{display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{e.note}</p>
+                <div className="flex items-center gap-3 mt-3">
+                  <button onClick={()=>setExpandedId(exp?null:e.id)} className="text-xs text-indigo-500 hover:text-indigo-700">{exp?"Collapse ↑":"Expand ↓"}</button>
+                  {exp&&<>
+                    <button onClick={()=>getFeedback(e)} disabled={bs?.loading} className="text-xs text-indigo-500 hover:text-indigo-700 disabled:opacity-40">🤖 Get AI feedback</button>
+                    <button onClick={()=>{setForm({ticker:e.ticker,assetType:e.assetType,entryType:e.entryType,sentiment:e.sentiment,note:e.note,date:e.date});setEditId(e.id);setShowForm(true);window.scrollTo(0,0);}} className="text-xs text-slate-400 hover:text-slate-600">Edit</button>
+                    <button onClick={()=>del(e.id)} className="text-xs text-rose-400 hover:text-rose-600">Delete</button>
+                  </>}
+                </div>
+                {exp&&<BuddyPanel text={bs?.text} loading={bs?.loading}/>}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ── Philosophy Tab ───────────────────────────────────────────────────────
+    function PhilosophyTab({ philosophy, setPhilosophy }) {
+      const [saved, setSaved] = useState(false); const timer=useRef(null);
+      const update=(k,v)=>{
+        const next={...philosophy,[k]:v}; setPhilosophy(next);
+        clearTimeout(timer.current);
+        timer.current=setTimeout(()=>{sset("investing_philosophy",next);setSaved(true);setTimeout(()=>setSaved(false),1500);},600);
+      };
+      const fields=[["style","Investing Style","text"],["principles","Core Principles","textarea",4],["avoid","What I Avoid","textarea",3],["persona","Buddy Persona","textarea",2],["heroes","Heroes & Influences","textarea",2]];
+      return (
+        <div className="max-w-2xl mx-auto py-6 space-y-5">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-slate-800 dark:text-slate-100 text-base">Your Investing Philosophy</h2>
+            {saved&&<span className="text-xs text-emerald-500 font-medium">✓ Saved</span>}
+          </div>
+          <p className="text-xs text-slate-400 dark:text-slate-500">Your buddy reads this before every interaction to stay on-strategy.</p>
+          {fields.map(([k,lbl,type,rows])=>(
+            <div key={k} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 shadow-sm">
+              <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-2">{lbl}</label>
+              {type==="text"
+                ?<input value={philosophy[k]||""} onChange={e=>update(k,e.target.value)} className="w-full text-sm text-slate-800 dark:text-slate-100 bg-transparent focus:outline-none border-b border-dashed border-slate-200 dark:border-slate-600 pb-1"/>
+                :<textarea rows={rows||3} value={philosophy[k]||""} onChange={e=>update(k,e.target.value)} className="w-full text-sm text-slate-800 dark:text-slate-100 bg-transparent resize-none focus:outline-none leading-relaxed"/>}
+            </div>
+          ))}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 shadow-sm">
+            <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-3">Risk Tolerance — <span className="text-indigo-500">{philosophy.risk??5}/10</span></label>
+            <input type="range" min={1} max={10} value={philosophy.risk??5} onChange={e=>update("risk",Number(e.target.value))} className="w-full mb-2"/>
+            <div className="flex justify-between text-xs text-slate-400"><span>1 — Capital preservation</span><span>10 — High risk/reward</span></div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Performance Tab ──────────────────────────────────────────────────────
+    const emptyPos = { ticker:"", name:"", assetType:"Stock", purchasePrice:"", shares:"", purchaseDate:"", targetPrice:"", stopLoss:"", notes:"" };
+    function PerformanceTab({ philosophy, settings, entries }) {
+      const [positions, setPositions] = useState([]);
+      const [quotes, setQuotes] = useState({}); const [chartData, setChartData] = useState([]);
+      const [selectedTicker, setSelectedTicker] = useState(null);
+      const [fetchingAll, setFetchingAll] = useState(false); const [fetchingChart, setFetchingChart] = useState(false);
+      const [errors, setErrors] = useState({}); const [showForm, setShowForm] = useState(false);
+      const [editId, setEditId] = useState(null); const [form, setForm] = useState(emptyPos);
+      const [buddyText, setBuddyText] = useState(""); const [buddyLoading, setBuddyLoading] = useState(false);
+      const [expandedId, setExpandedId] = useState(null);
+
+      useEffect(()=>{ setPositions(sget("positions",[])); },[]);
+
+      const persist=u=>{setPositions(u);sset("positions",u);};
+      const savePos=()=>{
+        if(!form.ticker.trim()) return;
+        const p={...form,ticker:form.ticker.toUpperCase(),purchasePrice:parseFloat(form.purchasePrice)||0,shares:parseFloat(form.shares)||0,targetPrice:parseFloat(form.targetPrice)||null,stopLoss:parseFloat(form.stopLoss)||null,id:editId||uid()};
+        persist(editId?positions.map(x=>x.id===editId?p:x):[...positions,p]);
+        setForm(emptyPos);setEditId(null);setShowForm(false);
+      };
+      const delPos=id=>{const p=positions.find(x=>x.id===id);persist(positions.filter(x=>x.id!==id));if(p)setQuotes(q=>{const n={...q};delete n[p.ticker];return n;});};
+
+      const fetchQuote=async(ticker,key)=>{
+        const res=await fetch(`${AV_BASE}?function=GLOBAL_QUOTE&symbol=${ticker}&apikey=${key}`);
+        const d=await res.json(); const q=d["Global Quote"];
+        if(!q||!q["05. price"]) throw new Error("No data");
+        return{price:parseFloat(q["05. price"]),change:parseFloat(q["09. change"]),changePct:parseFloat(q["10. change percent"]),high52:parseFloat(q["03. high"]),low52:parseFloat(q["04. low"]),volume:parseInt(q["06. volume"])};
+      };
+      const refreshAll=async()=>{
+        if(!settings.avKey) return; setFetchingAll(true);
+        const tickers=[...new Set(positions.map(p=>p.ticker))];
+        const newQ={...quotes},newE={...errors};
+        for(let i=0;i<tickers.length;i++){
+          const t=tickers[i];
+          try{newQ[t]=await fetchQuote(t,settings.avKey);delete newE[t];}catch(e){newE[t]=e.message;}
+          setQuotes({...newQ});setErrors({...newE});
+          if(i<tickers.length-1)await new Promise(r=>setTimeout(r,1100));
+        }
+        setFetchingAll(false);
+      };
+      const loadChart=async ticker=>{
+        if(!settings.avKey) return;
+        setSelectedTicker(ticker);setFetchingChart(true);setChartData([]);
+        try{
+          const res=await fetch(`${AV_BASE}?function=TIME_SERIES_DAILY&symbol=${ticker}&apikey=${settings.avKey}&outputsize=compact`);
+          const d=await res.json(); const series=d["Time Series (Daily)"];
+          if(!series) throw new Error();
+          setChartData(Object.entries(series).slice(0,30).reverse().map(([date,v])=>({date:date.slice(5),close:parseFloat(v["4. close"])})));
+        }catch{setChartData([]);}
+        setFetchingChart(false);
+      };
+      const reviewWithBuddy=async()=>{
+        setBuddyLoading(true);setBuddyText("");
+        try{
+          const ps=positions.map(p=>{const q=quotes[p.ticker];const cb=p.purchasePrice*p.shares;const cv=q?q.price*p.shares:null;const gl=cv?cv-cb:null;const glPct=gl&&cb?(gl/cb)*100:null;return`${p.ticker}: ${p.shares} shares @ ${formatNum(p.purchasePrice,settings)} | Cost: ${formatNum(cb,settings)}${q?` | Now: ${formatNum(q.price,settings)} | G/L: ${fDollarGeneric(gl,settings)} (${fPct(glPct)})`:""}${p.notes?` | ${p.notes}`:""}`}).join("\n");
+          const rel=entries.filter(e=>positions.map(p=>p.ticker).includes(e.ticker)).slice(0,8).map(e=>`[${e.date}] ${e.ticker} (${e.sentiment}): ${e.note.slice(0,200)}`).join("\n\n");
+          const text=await askBuddy(buildSys(philosophy,settings),`Review my portfolio:\n\nPOSITIONS:\n${ps||"(none)"}\n\nJOURNAL:\n${rel||"(none)"}\n\nWhat's working? What conflicts with my philosophy? What should I watch?`);
+          setBuddyText(text);
+        }catch(e){setBuddyText(`Error: ${e.message}`);}
+        setBuddyLoading(false);
+      };
+
+      const totalCost=positions.reduce((s,p)=>s+p.purchasePrice*p.shares,0);
+      const withPrices=positions.filter(p=>quotes[p.ticker]);
+      const totalValue=withPrices.reduce((s,p)=>s+quotes[p.ticker].price*p.shares,0);
+      const totalGL=totalValue-withPrices.reduce((s,p)=>s+p.purchasePrice*p.shares,0);
+      const returns=withPrices.map(p=>({ticker:p.ticker,ret:((quotes[p.ticker].price-p.purchasePrice)/p.purchasePrice)*100}));
+      const best=returns.length?returns.reduce((a,b)=>a.ret>b.ret?a:b):null;
+      const worst=returns.length?returns.reduce((a,b)=>a.ret<b.ret?a:b):null;
+      const currSym=CURRENCIES.find(c=>c.code===settings.currency)?.symbol||"$";
+
+      return (
+        <div className="max-w-2xl mx-auto py-6 space-y-5">
+          {!settings.avKey&&<div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-2xl p-4 text-sm text-amber-700 dark:text-amber-300">⚠️ No Alpha Vantage API key — open ⚙️ Settings to add one for live prices.</div>}
+          {positions.length>0&&<div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {[{lbl:"Positions",val:positions.length},{lbl:"Cost Basis",val:formatNum(totalCost,settings)},{lbl:"Market Value",val:withPrices.length?formatNum(totalValue,settings):"—"},{lbl:"Unrealized G/L",val:withPrices.length?fDollarGeneric(totalGL,settings):"—",color:totalGL>=0?"text-emerald-600":"text-rose-500"}].map(m=>(
+              <div key={m.lbl} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl p-3 text-center shadow-sm">
+                <p className="text-xs text-slate-400 dark:text-slate-500 mb-0.5">{m.lbl}</p>
+                <p className={`text-base font-bold ${m.color||"text-slate-800 dark:text-slate-100"}`}>{m.val}</p>
+              </div>
+            ))}
+          </div>}
+          {returns.length>0&&<div className="grid grid-cols-2 gap-3">
+            {[["🏆 Best",best,"text-emerald-600"],["📉 Worst",worst,"text-rose-500"]].map(([lbl,pos,color])=>(
+              <div key={lbl} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl p-3 shadow-sm"><p className="text-xs text-slate-400 dark:text-slate-500 mb-0.5">{lbl}</p><p className={`text-sm font-bold ${color}`}>{pos?.ticker} <span className="font-normal">{pos?fPct(pos.ret):""}</span></p></div>
+            ))}
+          </div>}
+          {returns.length>0&&(()=>{const maxAbs=Math.max(...returns.map(r=>Math.abs(r.ret)),1);return(
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 shadow-sm">
+              <h3 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-4">Return by Position</h3>
+              <div className="space-y-2.5">{[...returns].sort((a,b)=>b.ret-a.ret).map(r=>(
+                <div key={r.ticker} className="flex items-center gap-3">
+                  <span className="text-xs font-mono w-14 text-right text-slate-500 dark:text-slate-400">{r.ticker}</span>
+                  <div className="flex-1"><div className={`h-4 rounded ${r.ret>=0?"bg-emerald-400":"bg-rose-400"}`} style={{width:`${(Math.abs(r.ret)/maxAbs)*100}%`,minWidth:3}}/></div>
+                  <span className={`text-xs font-medium w-16 ${r.ret>=0?"text-emerald-600":"text-rose-500"}`}>{fPct(r.ret)}</span>
+                </div>
+              ))}</div>
+            </div>
+          );})()}
+
+          <div className="flex justify-between items-center">
+            <h2 className="font-semibold text-slate-800 dark:text-slate-100 text-base">Holdings</h2>
+            <div className="flex gap-2">
+              {settings.avKey&&positions.length>0&&<button onClick={refreshAll} disabled={fetchingAll} className="px-3 py-2 border border-indigo-300 text-indigo-600 text-sm font-medium rounded-xl hover:bg-indigo-50 disabled:opacity-50 flex items-center gap-1">{fetchingAll?<><span className="animate-spin inline-block">⟳</span> Fetching…</>:"⟳ Refresh"}</button>}
+              <button onClick={()=>{setForm(emptyPos);setEditId(null);setShowForm(v=>!v);}} className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-xl hover:bg-indigo-700">{showForm?"Cancel":"+ Add Holding"}</button>
+            </div>
+          </div>
+
+          {showForm&&(
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 shadow-sm space-y-4">
+              <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">{editId?"Edit Holding":"New Holding"}</h3>
+              <div className="grid grid-cols-2 gap-3">
+                {[["ticker","Ticker *","text","e.g. AAPL"],["name","Company Name","text","e.g. Apple Inc."],["purchasePrice","Purchase Price *","number","0.00"],["shares","Shares *","number","0"],["purchaseDate","Purchase Date","date",""],["targetPrice","Price Target","number","Optional"],["stopLoss","Stop Loss","number","Optional"]].map(([k,lbl,type,ph])=>(
+                  <div key={k}><label className="block text-xs text-slate-500 dark:text-slate-400 font-medium mb-1">{lbl}</label>
+                    <input type={type} placeholder={ph} value={form[k]} onChange={e=>setForm(f=>({...f,[k]:e.target.value}))} className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+                  </div>
+                ))}
+                <div><label className="block text-xs text-slate-500 dark:text-slate-400 font-medium mb-1">Asset Type</label>
+                  <select value={form.assetType} onChange={e=>setForm(f=>({...f,assetType:e.target.value}))} className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 focus:outline-none">{ASSET_TYPES.map(t=><option key={t}>{t}</option>)}</select>
+                </div>
+              </div>
+              <div><label className="block text-xs text-slate-500 dark:text-slate-400 font-medium mb-1">Investment Thesis / Notes</label>
+                <textarea rows={3} placeholder="Why are you holding this?" value={form.notes} onChange={e=>setForm(f=>({...f,notes:e.target.value}))} className="w-full border border-slate-200 dark:border-slate-600 rounded-xl px-3 py-2 text-sm bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+              </div>
+              <div className="flex justify-end gap-2">
+                <button onClick={()=>setShowForm(false)} className="px-4 py-2 text-sm text-slate-500">Cancel</button>
+                <button onClick={savePos} disabled={!form.ticker.trim()||!form.purchasePrice||!form.shares} className="px-5 py-2 bg-indigo-600 text-white text-sm font-semibold rounded-xl hover:bg-indigo-700 disabled:opacity-40">{editId?"Update":"Add Holding"}</button>
+              </div>
+            </div>
+          )}
+
+          {positions.length===0&&!showForm&&<div className="text-center py-16 text-slate-400 space-y-2"><p className="text-4xl">📊</p><p className="text-sm font-medium">No holdings yet</p><p className="text-xs">Add your first position to start tracking.</p></div>}
+
+          {positions.map(p=>{
+            const q=quotes[p.ticker];const err=errors[p.ticker];
+            const cb=p.purchasePrice*p.shares;const cv=q?q.price*p.shares:null;
+            const gl=cv?cv-cb:null;const glPct=gl&&cb?(gl/cb)*100:null;
+            const toTarget=p.targetPrice&&q?((p.targetPrice-q.price)/q.price)*100:null;
+            const toStop=p.stopLoss&&q?((q.price-p.stopLoss)/q.price)*100:null;
+            const exp=expandedId===p.id;
+            return (
+              <div key={p.id} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-sm">
+                <div className="p-5">
+                  <div className="flex items-start justify-between mb-3">
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button onClick={()=>loadChart(p.ticker)} className="font-mono font-bold text-indigo-600 dark:text-indigo-400 hover:underline text-base">{p.ticker}</button>
+                        {p.name&&<span className="text-sm text-slate-500 dark:text-slate-400">{p.name}</span>}
+                        <span className="text-xs bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 px-2 py-0.5 rounded-full">{p.assetType}</span>
+                      </div>
+                      {p.purchaseDate&&<p className="text-xs text-slate-400 mt-0.5">Purchased {p.purchaseDate}</p>}
+                    </div>
+                    {q&&<div className="text-right"><p className="text-lg font-bold text-slate-800 dark:text-slate-100">{formatNum(q.price,settings)}</p><p className={`text-xs font-medium ${q.changePct>=0?"text-emerald-600":"text-rose-500"}`}>{q.changePct>=0?"+":""}{q.changePct.toFixed(2)}% today</p></div>}
+                    {err&&<span className="text-xs text-rose-400 bg-rose-50 dark:bg-rose-900/20 px-2 py-1 rounded-lg">{err}</span>}
+                    {!q&&!err&&<span className="text-xs text-slate-300 dark:text-slate-600">not loaded</span>}
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 mb-3">
+                    {[["Shares",p.shares],["Avg Cost",formatNum(p.purchasePrice,settings)],settings.showCostBasis&&["Cost Basis",formatNum(cb,settings)],cv&&["Mkt Value",formatNum(cv,settings)],gl!==null&&["G/L $",{val:fDollarGeneric(gl,settings),color:gl>=0?"text-emerald-600":"text-rose-500",bg:gl>=0?"bg-emerald-50 dark:bg-emerald-900/20":"bg-rose-50 dark:bg-rose-900/20"}],glPct!==null&&["G/L %",{val:fPct(glPct),color:glPct>=0?"text-emerald-600":"text-rose-500",bg:glPct>=0?"bg-emerald-50 dark:bg-emerald-900/20":"bg-rose-50 dark:bg-rose-900/20"}]].filter(Boolean).map(([lbl,val])=>{
+                      const isObj=typeof val==="object"&&val!==null&&"val" in val;
+                      return <div key={lbl} className={`rounded-xl p-2 text-center ${isObj?val.bg:"bg-slate-50 dark:bg-slate-800"}`}><p className="text-xs text-slate-400 dark:text-slate-500">{lbl}</p><p className={`text-sm font-semibold ${isObj?val.color:"text-slate-700 dark:text-slate-200"}`}>{isObj?val.val:val}</p></div>;
+                    })}
+                  </div>
+                  {exp&&<>
+                    {(p.targetPrice||p.stopLoss)&&<div className="grid grid-cols-2 gap-2 mb-3">
+                      {p.targetPrice&&<div className="bg-indigo-50 dark:bg-indigo-900/20 rounded-xl p-2 text-center"><p className="text-xs text-slate-400">Target</p><p className="text-sm font-semibold text-indigo-600 dark:text-indigo-400">{formatNum(p.targetPrice,settings)}</p>{toTarget!==null&&<p className="text-xs text-indigo-400">{fPct(toTarget)} away</p>}</div>}
+                      {p.stopLoss&&<div className="bg-rose-50 dark:bg-rose-900/20 rounded-xl p-2 text-center"><p className="text-xs text-slate-400">Stop Loss</p><p className="text-sm font-semibold text-rose-600">{formatNum(p.stopLoss,settings)}</p>{toStop!==null&&<p className="text-xs text-rose-400">{fPct(toStop)} cushion</p>}</div>}
+                    </div>}
+                    {q&&<div className="flex gap-2 mb-3">
+                      {[["52W High",formatNum(q.high52,settings)],["52W Low",formatNum(q.low52,settings)],["Volume",q.volume?.toLocaleString()]].map(([lbl,val])=>(
+                        <div key={lbl} className="flex-1 bg-slate-50 dark:bg-slate-800 rounded-xl p-2 text-center"><p className="text-xs text-slate-400">{lbl}</p><p className="text-sm font-semibold text-slate-700 dark:text-slate-200">{val}</p></div>
+                      ))}
+                    </div>}
+                    {p.notes&&<div className="bg-slate-50 dark:bg-slate-800 rounded-xl p-3 mb-3"><p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Thesis</p><p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">{p.notes}</p></div>}
+                  </>}
+                  <div className="flex items-center gap-3 mt-1">
+                    <button onClick={()=>setExpandedId(exp?null:p.id)} className="text-xs text-indigo-500 hover:text-indigo-700">{exp?"Collapse ↑":"Details ↓"}</button>
+                    <button onClick={()=>{setForm({ticker:p.ticker,name:p.name||"",assetType:p.assetType,purchasePrice:p.purchasePrice,shares:p.shares,purchaseDate:p.purchaseDate||"",targetPrice:p.targetPrice||"",stopLoss:p.stopLoss||"",notes:p.notes||""});setEditId(p.id);setShowForm(true);window.scrollTo(0,0);}} className="text-xs text-slate-400 hover:text-slate-600">Edit</button>
+                    <button onClick={()=>delPos(p.id)} className="text-xs text-rose-400 hover:text-rose-600">Remove</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+
+          {selectedTicker&&(
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 shadow-sm">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide">{selectedTicker} — 30-Day Chart</h3>
+                <button onClick={()=>setSelectedTicker(null)} className="text-xs text-slate-400 hover:text-slate-600">Close</button>
+              </div>
+              {fetchingChart?<div className="text-center text-sm text-slate-400 py-10">⟳ Loading…</div>
+              :chartData.length===0?<div className="text-center text-sm text-slate-400 py-10">No chart data.</div>
+              :<ResponsiveContainer width="100%" height={200}>
+                <LineChart data={chartData}>
+                  <XAxis dataKey="date" tick={{fontSize:10}} tickLine={false} axisLine={false} interval={6}/>
+                  <YAxis domain={["auto","auto"]} tick={{fontSize:10}} tickLine={false} axisLine={false} tickFormatter={v=>`${currSym}${v}`} width={55}/>
+                  <Tooltip formatter={v=>formatNum(v,settings)} labelStyle={{fontSize:11}} contentStyle={{borderRadius:8,fontSize:11,border:"1px solid #e2e8f0"}}/>
+                  <Line type="monotone" dataKey="close" stroke="#6366f1" strokeWidth={2} dot={false}/>
+                </LineChart>
+              </ResponsiveContainer>}
+            </div>
+          )}
+
+          {positions.length>0&&(
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-5 shadow-sm">
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide">AI Portfolio Review</h3>
+                <button onClick={reviewWithBuddy} disabled={buddyLoading} className="px-4 py-2 bg-indigo-600 text-white text-xs font-semibold rounded-xl hover:bg-indigo-700 disabled:opacity-50 flex items-center gap-1">{buddyLoading?<><span className="animate-spin inline-block">⟳</span> Reviewing…</>:"🤖 Review with buddy"}</button>
+              </div>
+              <p className="text-xs text-slate-400 dark:text-slate-500 mb-2">Sends your portfolio + journal entries for a philosophy-aware commentary.</p>
+              <BuddyPanel text={buddyText} loading={buddyLoading}/>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── App Shell ────────────────────────────────────────────────────────────
+    function App() {
+      const [tab, setTab] = useState("journal");
+      const [showSettings, setShowSettings] = useState(false);
+      const [philosophy, setPhilosophy] = useState(null);
+      const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+      const [entries, setEntries] = useState([]);
+      const [appLoading, setAppLoading] = useState(true);
+
+      useEffect(()=>{
+        const phil = sget("investing_philosophy", null);
+        const ents = sget("journal_entries", []);
+        const sett = {...DEFAULT_SETTINGS, ...sget("app_settings", {})};
+        setPhilosophy(phil);
+        setEntries(ents||[]);
+        setSettings(sett);
+        setAppLoading(false);
+      },[]);
+
+      useEffect(()=>{
+        if(!appLoading) setEntries(sget("journal_entries",[]));
+      },[tab]);
+
+      const handleSettingsSave = s => setSettings(s);
+      const handlePhilosophyDone = answers => {
+        const phil={...answers,done:true};
+        sset("investing_philosophy",phil);
+        setPhilosophy(phil);
+      };
+      const handleSetPhilosophy = p => { setPhilosophy(p); sset("investing_philosophy",p); };
+
+      const dark = isDark(settings.theme);
+      const TABS=[["journal","📝 Journal"],["philosophy","🧠 Philosophy"],["performance","📊 Performance"]];
+      const currSym=CURRENCIES.find(c=>c.code===settings.currency)?.symbol||"$";
+
+      if(appLoading) return <div className="min-h-screen flex items-center justify-center bg-slate-50"><span className="text-slate-400">Loading…</span></div>;
+      if(!philosophy) return <OnboardingWizard onDone={handlePhilosophyDone}/>;
+
+      return (
+        <div className={dark?"dark":""}>
+          <div className="min-h-screen bg-slate-50 dark:bg-slate-950 font-sans">
+            {showSettings&&<SettingsModal settings={settings} onSave={handleSettingsSave} onClose={()=>setShowSettings(false)}/>}
+            <header className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 sticky top-0 z-40">
+              <div className="max-w-2xl mx-auto px-4 py-3 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-xl">📒</span>
+                  <span className="font-bold text-slate-800 dark:text-slate-100 text-base">Investing Journal</span>
+                  <span className="text-xs bg-indigo-100 dark:bg-indigo-900/50 text-indigo-600 dark:text-indigo-300 px-2 py-0.5 rounded-full font-medium">{philosophy.style}</span>
+                  <span className="text-xs text-slate-400 dark:text-slate-500 font-mono">{currSym}</span>
+                </div>
+                <button onClick={()=>setShowSettings(true)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 text-lg p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">⚙️</button>
+              </div>
+              <div className="max-w-2xl mx-auto px-4 flex">
+                {TABS.map(([key,label])=>(
+                  <button key={key} onClick={()=>setTab(key)} className={`flex-1 py-2.5 text-sm font-medium border-b-2 transition-colors ${tab===key?"border-indigo-500 text-indigo-600 dark:text-indigo-400":"border-transparent text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300"}`}>{label}</button>
+                ))}
+              </div>
+            </header>
+            <main className="px-4">
+              {tab==="journal"&&<JournalTab philosophy={philosophy} settings={settings}/>}
+              {tab==="philosophy"&&<PhilosophyTab philosophy={philosophy} setPhilosophy={handleSetPhilosophy}/>}
+              {tab==="performance"&&<PerformanceTab philosophy={philosophy} settings={settings} entries={entries}/>}
+            </main>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
